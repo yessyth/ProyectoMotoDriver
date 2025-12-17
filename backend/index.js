@@ -33,6 +33,18 @@ const pool = new Pool({
 io.on('connection', (socket) => {
   console.log('Un usuario se conectó:', socket.id);
 
+  // Escuchar ubicación del conductor
+  socket.on('actualizar_ubicacion', async (data) => {
+    // data: { conductor_id, coords: { lat, lng } }
+    io.emit('ubicacion_conductor', data);
+
+    // PERSISTENCIA: Actualizar DB
+    try {
+      await pool.query('UPDATE motocarros SET lat = $1, lng = $2 WHERE conductor_id = $3',
+        [data.coords.lat, data.coords.lng, data.conductor_id]);
+    } catch (e) { console.error('Error guardando locacion', e); }
+  });
+
   socket.on('disconnect', () => {
     console.log('Usuario desconectado:', socket.id);
   });
@@ -60,47 +72,96 @@ app.post('/api/login', async (req, res) => {
   }
 });
 
+// REGISTRO
+app.post('/api/register', async (req, res) => {
+  const { nombre, email, password, rol } = req.body;
+  try {
+    // Validación básica de roles
+    if (!['dueno', 'conductor', 'cliente'].includes(rol)) {
+      return res.status(400).json({ success: false, message: 'Rol inválido' });
+    }
+
+    // Verificar si el correo ya existe
+    const userCheck = await pool.query('SELECT * FROM usuarios WHERE email = $1', [email]);
+    if (userCheck.rows.length > 0) {
+      return res.status(400).json({ success: false, message: 'El correo ya está registrado' });
+    }
+
+    // Insertar usuario
+    const result = await pool.query(
+      'INSERT INTO usuarios (nombre, email, password, rol) VALUES ($1, $2, $3, $4) RETURNING *',
+      [nombre, email, password, rol]
+    );
+
+    // Si es conductor, podríamos necesitar inicializarlo en la tabla motocarros? 
+    // Por ahora el flujo actual asigna motocarros luego.
+
+    res.json({ success: true, user: result.rows[0] });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json(err);
+  }
+});
+
 // ==========================================
 // ROL: DUEÑO (ADMINISTRADOR)
 // ==========================================
 
-// 1. Estadísticas Generales
+// 1. Estadísticas Generales (FILTRADO POR DUEÑO)
 app.get('/api/reportes/estadisticas', async (req, res) => {
+  const { dueno_id } = req.query;
   try {
-    const viajes = await pool.query('SELECT COUNT(*) as total FROM viajes');
-    const dinero = await pool.query("SELECT SUM(costo) as total_dinero FROM viajes WHERE estado = 'pagado'");
+    // Si no hay dueno_id, devolvemos 0 (o error, pero 0 es más seguro para evitar crash)
+    if (!dueno_id) return res.json({ viajes: 0, ingresos: 0 });
+
+    const viajes = await pool.query(
+      "SELECT COUNT(*) as total FROM viajes v JOIN usuarios u ON v.conductor_id = u.id WHERE u.dueno_id = $1",
+      [dueno_id]
+    );
+    const dinero = await pool.query(
+      "SELECT SUM(costo) as total_dinero FROM viajes v JOIN usuarios u ON v.conductor_id = u.id WHERE v.estado = 'pagado' AND u.dueno_id = $1",
+      [dueno_id]
+    );
     res.json({ viajes: viajes.rows[0].total, ingresos: dinero.rows[0].total_dinero });
   } catch (err) { res.status(500).json(err); }
 });
 
-// 1.1 Estadísticas Detalladas (Para el Dueño)
+// 1.1 Estadísticas Detalladas (FILTRADO POR DUEÑO)
 app.get('/api/reportes/detallados', async (req, res) => {
+  const { dueno_id } = req.query;
   try {
-    // Join para obtener datos del conductor y del motocarro asociado
-    // Nota: Asume que el conductor tiene el mismo carro asignado (limitación del modelo actual)
+    if (!dueno_id) return res.json([]);
+
     const query = `
       SELECT v.*, u.nombre as nombre_conductor, m.placa, m.modelo 
       FROM viajes v
       LEFT JOIN usuarios u ON v.conductor_id = u.id
       LEFT JOIN motocarros m ON v.conductor_id = m.conductor_id
-      WHERE v.estado = 'pagado'
+      WHERE v.estado = 'pagado' AND u.dueno_id = $1
       ORDER BY v.fecha DESC
     `;
-    const result = await pool.query(query);
+    const result = await pool.query(query, [dueno_id]);
     res.json(result.rows);
   } catch (err) { res.status(500).json(err); }
 });
 
-// 2. Gestión de Conductores
+// 2. Gestión de Conductores (FILTRADO POR DUEÑO)
 app.get('/api/conductores', async (req, res) => {
-  const result = await pool.query("SELECT * FROM usuarios WHERE rol = 'conductor' ORDER BY id DESC");
-  res.json(result.rows);
+  const { dueno_id } = req.query;
+  try {
+    if (!dueno_id) return res.json([]);
+    const result = await pool.query("SELECT * FROM usuarios WHERE rol = 'conductor' AND dueno_id = $1 ORDER BY id DESC", [dueno_id]);
+    res.json(result.rows);
+  } catch (err) { res.status(500).json(err); }
 });
 
 app.post('/api/conductores', async (req, res) => {
-  const { nombre, email, password } = req.body;
+  const { nombre, email, password, dueno_id } = req.body;
   try {
-    await pool.query("INSERT INTO usuarios (nombre, email, password, rol) VALUES ($1, $2, $3, 'conductor')", [nombre, email, password]);
+    await pool.query(
+      "INSERT INTO usuarios (nombre, email, password, rol, dueno_id) VALUES ($1, $2, $3, 'conductor', $4)",
+      [nombre, email, password, dueno_id]
+    );
     res.json({ success: true });
   } catch (err) { res.status(500).json(err); }
 });
@@ -115,22 +176,38 @@ app.delete('/api/conductores/:id', async (req, res) => {
   } catch (err) { res.status(500).json(err); }
 });
 
-// 3. Gestión de Motocarros
+// 3. Gestión de Motocarros (FILTRADO POR DUEÑO)
 app.get('/api/motocarros', async (req, res) => {
-  const query = `
-    SELECT m.*, u.nombre as nombre_conductor 
-    FROM motocarros m 
-    LEFT JOIN usuarios u ON m.conductor_id = u.id
-    ORDER BY m.id DESC
-  `;
-  const result = await pool.query(query);
-  res.json(result.rows);
+  const { dueno_id } = req.query; // Para filtrar lista
+  try {
+    // Nota: Si dueno_id viene, filtramos. Si no, mostramos todos (ej. para cliente), pero cliente usa otro endpoint.
+    // El dueño usa este endpoint.
+    let query = `
+      SELECT m.*, u.nombre as nombre_conductor 
+      FROM motocarros m 
+      LEFT JOIN usuarios u ON m.conductor_id = u.id
+    `;
+    let params = [];
+
+    if (dueno_id) {
+      query += ` WHERE m.dueno_id = $1`;
+      params.push(dueno_id);
+    }
+
+    query += ` ORDER BY m.id DESC`;
+
+    const result = await pool.query(query, params);
+    res.json(result.rows);
+  } catch (err) { res.status(500).json(err); }
 });
 
 app.post('/api/motocarros', async (req, res) => {
-  const { placa, modelo, conductor_id } = req.body;
+  const { placa, modelo, conductor_id, dueno_id } = req.body;
   try {
-    await pool.query('INSERT INTO motocarros (placa, modelo, conductor_id) VALUES ($1, $2, $3)', [placa, modelo, conductor_id]);
+    await pool.query(
+      'INSERT INTO motocarros (placa, modelo, conductor_id, dueno_id) VALUES ($1, $2, $3, $4)',
+      [placa, modelo, conductor_id || null, dueno_id]
+    );
     res.json({ success: true });
   } catch (err) { res.status(500).json(err); }
 });
@@ -156,11 +233,11 @@ app.get('/api/motocarros/disponibles', async (req, res) => {
 
 // 2. Solicitar Viaje
 app.post('/api/viajes/solicitar', async (req, res) => {
-  const { cliente_id, origen, destino, costo } = req.body;
+  const { cliente_id, origen, destino, costo, lat_origen, lng_origen } = req.body;
   try {
     const result = await pool.query(
-      "INSERT INTO viajes (cliente_id, origen, destino, estado, costo) VALUES ($1, $2, $3, 'solicitado', $4) RETURNING *",
-      [cliente_id, origen, destino, costo]
+      "INSERT INTO viajes (cliente_id, origen, destino, estado, costo, lat_origen, lng_origen) VALUES ($1, $2, $3, 'solicitado', $4, $5, $6) RETURNING *",
+      [cliente_id, origen, destino, costo, lat_origen || null, lng_origen || null]
     );
     const nuevoViaje = result.rows[0];
 
@@ -286,7 +363,22 @@ server.listen(3001, async () => {
   try {
     // 1. Agregar columna fecha si no existe
     await pool.query("ALTER TABLE viajes ADD COLUMN IF NOT EXISTS fecha TIMESTAMP DEFAULT CURRENT_TIMESTAMP");
-    console.log("✅ Base de datos actualizada: Columna 'fecha' verificada.");
+
+    // 2. Agregar columna dueno_id a usuarios (para enlazar conductores con dueños)
+    await pool.query("ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS dueno_id INTEGER DEFAULT NULL");
+
+    // 3. Agregar columna dueno_id a motocarros (para saber de quién es el motocarro)
+    await pool.query("ALTER TABLE motocarros ADD COLUMN IF NOT EXISTS dueno_id INTEGER DEFAULT NULL");
+
+    // 4. Agregar coordenadas a motocarros
+    await pool.query("ALTER TABLE motocarros ADD COLUMN IF NOT EXISTS lat FLOAT DEFAULT 4.6097");
+    await pool.query("ALTER TABLE motocarros ADD COLUMN IF NOT EXISTS lng FLOAT DEFAULT -74.0817");
+
+    // 5. Agregar coordenadas al viaje
+    await pool.query("ALTER TABLE viajes ADD COLUMN IF NOT EXISTS lat_origen FLOAT");
+    await pool.query("ALTER TABLE viajes ADD COLUMN IF NOT EXISTS lng_origen FLOAT");
+
+    console.log("✅ Base de datos actualizada: Columnas 'fecha', 'dueno_id' y coordenadas verificadas.");
   } catch (err) {
     console.error("Error en migración DB:", err.message);
   }
