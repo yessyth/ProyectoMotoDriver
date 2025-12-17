@@ -35,7 +35,7 @@ const clientIcon = new L.Icon({
     iconSize: [35, 35],
 });
 
-export default function MapComponent({ center, markers = [], onLocationSelect, style }) {
+export default function MapComponent({ center, markers = [], onLocationSelect, onMarkerClick, style }) {
     // Default center: Some city coord (e.g., Bogota or generic)
     const defaultCenter = [4.6097, -74.0817];
 
@@ -53,6 +53,9 @@ export default function MapComponent({ center, markers = [], onLocationSelect, s
                         key={idx}
                         position={[marker.lat, marker.lng]}
                         icon={marker.type === 'driver' ? driverIcon : clientIcon}
+                        eventHandlers={{
+                            click: () => onMarkerClick && onMarkerClick(marker),
+                        }}
                     >
                         {marker.popup && <Popup>{marker.popup}</Popup>}
                     </Marker>

@@ -342,6 +342,20 @@ app.post('/api/viajes/aceptar', async (req, res) => {
   } catch (err) { res.status(500).json(err); }
 });
 
+// 3.5 Iniciar Viaje (Recogida de pasajero)
+app.post('/api/viajes/iniciar', async (req, res) => {
+  const { viaje_id } = req.body;
+  try {
+    // Actualizar estado a en_curso
+    await pool.query("UPDATE viajes SET estado = 'en_curso' WHERE id = $1", [viaje_id]);
+
+    // Notificar
+    io.emit('viaje_iniciado', { viaje_id });
+
+    res.json({ success: true });
+  } catch (err) { res.status(500).json(err); }
+});
+
 // 4. Mis Reportes (Conductor)
 app.get('/api/conductores/:id/reportes', async (req, res) => {
   try {

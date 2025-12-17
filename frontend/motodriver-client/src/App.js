@@ -346,8 +346,17 @@ function ClienteDashboard({ user }) {
       });
     });
 
+    socket.on('viaje_iniciado', (data) => {
+      setViajeActual(prev => {
+        if (prev && prev.id === data.viaje_id) {
+          return { ...prev, estado: 'en_curso' };
+        }
+        return prev;
+      });
+    });
+
     return () => {
-      socket.off('conductor_ocupado'); socket.off('conductor_disponible'); socket.off('estado_conductor_cambiado'); socket.off('viaje_aceptado'); socket.off('ubicacion_conductor');
+      socket.off('conductor_ocupado'); socket.off('conductor_disponible'); socket.off('estado_conductor_cambiado'); socket.off('viaje_aceptado'); socket.off('ubicacion_conductor'); socket.off('viaje_iniciado');
     };
   }, [cargarMotos, viajeActual]);
 
@@ -387,13 +396,17 @@ function ClienteDashboard({ user }) {
     });
   }
 
-  // 2. Si estamos en viaje aceptado, mostrar SOLO mi conductor
-  if (viajeActual && viajeActual.estado === 'aceptado' && driverLocation) {
+  // 2. Si estamos en viaje aceptado O en curso, mostrar SOLO mi conductor
+  if (viajeActual && (viajeActual.estado === 'aceptado' || viajeActual.estado === 'en_curso') && driverLocation) {
     markers.push({ ...driverLocation, type: 'driver', popup: 'Tu Conductor' });
   }
 
   // 3. Mostrar MI ubicación (Pickup)
-  if (pickupCoords) {
+  // Si está EN CURSO, mi ubicación es la del conductor (me recogió)
+  if (viajeActual && viajeActual.estado === 'en_curso' && driverLocation) {
+    markers.push({ ...driverLocation, type: 'client', popup: 'Tú (En viaje)' });
+  } else if (pickupCoords) {
+    // Si no ha iniciado el viaje o estoy esperando, mi ubicación es lat_origen
     markers.push({ lat: pickupCoords.lat, lng: pickupCoords.lng, type: 'client', popup: 'Tu Ubicación' });
   }
 
@@ -429,7 +442,7 @@ function ClienteDashboard({ user }) {
           <div className={`card-custom p-5 text-center h-100 ${viajeActual.estado === 'aceptado' ? 'border-primary' : ''}`}>
 
             {/* MAPA EN TIEMPO REAL */}
-            {viajeActual.estado === 'aceptado' && (
+            {(viajeActual.estado === 'aceptado' || viajeActual.estado === 'en_curso') && (
               <div className="mb-4 text-start">
                 <label className="fw-bold text-primary mb-2">📍 RASTREO EN VIVO</label>
                 <MapComponent center={driverLocation ? [driverLocation.lat, driverLocation.lng] : mapCenter} markers={markers} style={{ height: '300px', width: '100%' }} />
@@ -449,10 +462,10 @@ function ClienteDashboard({ user }) {
               </div>
             )}
 
-            {viajeActual.estado === 'aceptado' && (
+            {(viajeActual.estado === 'aceptado' || viajeActual.estado === 'en_curso') && (
               <div className="animate-fade-in">
-                <h2 className="text-primary-custom fw-bold mb-3">¡Viaje Iniciado!</h2>
-                <div className="alert alert-success rounded-pill px-4">Tu conductor está en camino.</div>
+                <h2 className="text-primary-custom fw-bold mb-3">{viajeActual.estado === 'aceptado' ? '¡Tu conductor está en camino!' : '¡En viaje a tu destino!'}</h2>
+                <div className="alert alert-success rounded-pill px-4">{viajeActual.estado === 'aceptado' ? 'Prepárate para abordar.' : 'Disfruta el recorrido.'}</div>
 
                 <div className="bg-light p-4 rounded-xl mb-4 text-start">
                   <h5 className="fw-bold mb-3">Detalles del Servicio</h5>
@@ -510,6 +523,7 @@ function ConductorDashboard({ user }) {
   const [viendoReportes, setViendoReportes] = useState(false);
   const [misReportes, setMisReportes] = useState([]);
   const [activeTripClientLocation, setActiveTripClientLocation] = useState(null); // Store active trip client loc
+  const [passengerPickedUp, setPassengerPickedUp] = useState(false);
 
   // MAP STATE
   const [myLocation, setMyLocation] = useState({ lat: 4.6097, lng: -74.0817 });
@@ -548,6 +562,7 @@ function ConductorDashboard({ user }) {
       if (data.conductor_id === user.id) {
         setCurrentViajeId(null);
         setActiveTripClientLocation(null); // Limpiar marcador del pasajero
+        setPassengerPickedUp(false);
         alert("¡Te han pagado! Ya estás disponible nuevamente.");
         actualizarSolicitudes();
       }
@@ -580,6 +595,7 @@ function ConductorDashboard({ user }) {
       } else {
         setActiveTripClientLocation(null);
       }
+      setPassengerPickedUp(false);
 
       await axios.post(`${API_URL}/viajes/aceptar`, { viaje_id: id, conductor_id: user.id });
       setCurrentViajeId(id);
@@ -598,6 +614,24 @@ function ConductorDashboard({ user }) {
     setMyLocation(latlng);
     // Emitir al servidor
     socket.emit('actualizar_ubicacion', { conductor_id: user.id, coords: latlng });
+
+    if (passengerPickedUp) {
+      setActiveTripClientLocation(latlng);
+    }
+  };
+
+  const handleMarkerClick = async (marker) => {
+    if (marker.type === 'client' && currentViajeId) {
+      setMyLocation({ lat: marker.lat, lng: marker.lng });
+      socket.emit('actualizar_ubicacion', { conductor_id: user.id, coords: { lat: marker.lat, lng: marker.lng } });
+
+      // CALL BACKEND TO START TRIP (Syncs with client)
+      try {
+        await axios.post(`${API_URL}/viajes/iniciar`, { viaje_id: currentViajeId });
+        setPassengerPickedUp(true);
+        setActiveTripClientLocation({ lat: marker.lat, lng: marker.lng });
+      } catch (e) { console.error(e); }
+    }
   };
 
   return (
@@ -626,9 +660,38 @@ function ConductorDashboard({ user }) {
         {viendoReportes ? (
           <div className="p-4 animate-fade-in">
             <h4 className="fw-bold mb-4 text-primary-custom">Historial de Viajes</h4>
-            {/* Report Tables (Simplified) */}
-            {/* ... */}
-            <button className="btn btn-secondary" onClick={() => setViendoReportes(false)}>Volver</button>
+            {misReportes.length === 0 ? (
+              <p className="text-muted text-center pt-5">No has realizado viajes aún.</p>
+            ) : (
+              <div className="table-responsive">
+                <table className="table table-hover align-middle">
+                  <thead className="bg-light">
+                    <tr>
+                      <th>Fecha</th>
+                      <th>Origen/Destino</th>
+                      <th>Costo</th>
+                      <th>Calif.</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {misReportes.map(r => (
+                      <tr key={r.id}>
+                        <td><small>{new Date(r.fecha).toLocaleDateString()}</small><br /><small className='text-muted'>{new Date(r.fecha).toLocaleTimeString()}</small></td>
+                        <td>
+                          <div className="d-flex flex-column" style={{ fontSize: '0.85em' }}>
+                            <span><strong>Desde:</strong> {r.origen}</span>
+                            <span><strong>Hasta:</strong> {r.destino}</span>
+                          </div>
+                        </td>
+                        <td className="fw-bold text-success">${r.costo}</td>
+                        <td><span className="text-warning">★</span> {r.calificacion}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            )}
+            <button className="btn btn-secondary mt-3" onClick={() => setViendoReportes(false)}>Volver al Mapa</button>
           </div>
         ) : (
           currentViajeId ? (
@@ -647,6 +710,7 @@ function ConductorDashboard({ user }) {
                   ...(activeTripClientLocation ? [{ lat: activeTripClientLocation.lat, lng: activeTripClientLocation.lng, type: 'client', popup: 'Pasajero' }] : [])
                 ]}
                 onLocationSelect={handleMapClick}
+                onMarkerClick={handleMarkerClick}
                 style={{ height: '300px' }}
               />
 
